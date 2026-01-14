@@ -1,31 +1,39 @@
-from flask import Flask, render_template, request, redirect, url_for
-import sqlite3
-import uuid
 import os
+import uuid
+from flask import Flask, render_template, request, redirect, url_for
+from flask_sqlalchemy import SQLAlchemy
 
 app = Flask(__name__)
 
-def get_db():
-    conn = sqlite3.connect('gamer_system.db')
-    conn.row_factory = sqlite3.Row
-    return conn
+# --- DATABASE CONFIG ---
+database_url = os.getenv("DATABASE_URL") or os.getenv("MYSQL_URL")
 
-def init_db():
-    conn = get_db()
-    # Create table with all columns
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS gamers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            favorite_game TEXT NOT NULL,
-            platform TEXT,
-            region TEXT,
-            rank TEXT NOT NULL
-        )
-    ''')
-    conn.commit()
-    conn.close()
+if database_url and database_url.startswith("mysql://"):
+    database_url = database_url.replace("mysql://", "mysql+pymysql://", 1)
 
+# Fallback for local dev
+if not database_url:
+    database_url = "sqlite:///gamer_system.db"
+
+app.config["SQLALCHEMY_DATABASE_URI"] = database_url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+
+# --- MODEL ---
+class Gamer(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(120), nullable=False)
+    favorite_game = db.Column(db.String(120), nullable=False)
+    platform = db.Column(db.String(50))
+    region = db.Column(db.String(50))
+    rank = db.Column(db.String(50), nullable=False)
+
+# --- AUTO CREATE TABLES (GUNICORN SAFE) ---
+with app.app_context():
+    db.create_all()
+
+# --- ROUTES ---
 @app.route('/')
 def index():
     return render_template('register.html')
@@ -38,52 +46,42 @@ def submit():
     platform = request.form.get('platform')
     region = request.form.get('region')
 
-    agent_id = f"MG-{str(uuid.uuid4())[:4].upper()}"
+    agent_id = f"MG-{uuid.uuid4().hex[:8].upper()}"
     identity = f"{agent_id} | {username}"
 
-    conn = get_db()
-    conn.execute("INSERT INTO gamers (username, favorite_game, rank, platform, region) VALUES (?, ?, ?, ?, ?)",
-                 (identity, game, rank, platform, region))
-    conn.commit()
-    conn.close()
+    gamer = Gamer(
+        username=identity,
+        favorite_game=game,
+        rank=rank,
+        platform=platform,
+        region=region
+    )
+
+    db.session.add(gamer)
+    db.session.commit()
+
     return redirect(url_for('gamers'))
 
 @app.route('/gamers')
 def gamers():
-    conn = get_db()
-    rows = conn.execute("SELECT * FROM gamers ORDER BY id DESC").fetchall()
-    conn.close()
+    rows = Gamer.query.order_by(Gamer.id.desc()).all()
     return render_template('gamers.html', gamers=rows)
 
-# --- NEW PURGE ROUTE ---
+# --- DELETE SINGLE (POST ONLY) ---
+@app.route('/delete/<int:id>', methods=['POST'])
+def delete_gamer(id):
+    gamer = Gamer.query.get_or_404(id)
+    db.session.delete(gamer)
+    db.session.commit()
+    return redirect(url_for('gamers'))
+
+# --- PURGE ALL ---
 @app.route('/purge', methods=['POST'])
 def purge():
-    conn = get_db()
-    conn.execute("DELETE FROM gamers")
-    conn.execute("DELETE FROM sqlite_sequence WHERE name='gamers'") # Resets ID to 1
-    conn.commit()
-    conn.close()
+    db.session.query(Gamer).delete()
+    db.session.commit()
     return redirect(url_for('gamers'))
 
-# Add this for the individual PURGE buttons
-@app.route('/delete/<int:id>')
-def delete_gamer(id):
-    conn = get_db()
-    conn.execute("DELETE FROM gamers WHERE id = ?", (id,))
-    conn.commit()
-    conn.close()
-    return redirect(url_for('gamers'))
-
-# Add this if you want a "Purge All" button
-@app.route('/purge_all', methods=['POST'])
-def purge_all():
-    conn = get_db()
-    conn.execute("DELETE FROM gamers")
-    conn.execute("DELETE FROM sqlite_sequence WHERE name='gamers'") # Resets IDs to 1
-    conn.commit()
-    conn.close()
-    return redirect(url_for('gamers'))
-
+# --- ENTRY POINT ---
 if __name__ == '__main__':
-    init_db()
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=8080)
